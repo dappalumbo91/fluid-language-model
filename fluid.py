@@ -28,9 +28,15 @@ would not fit in four places is not attempted. The last written power is
 then divided by the base, and that quotient has to be the previous line.
 The command does not train and it does not write a checkpoint.
 
+``steps`` is the one runner for a new formula. A formula is a list of
+operations on names. ``prev`` is the token list the previous line wrote.
+The same runner multiplies, adds, and inverts. It does not train and it
+does not write a checkpoint.
+
     python -u fluid.py
     python -u fluid.py think
     python -u fluid.py power
+    python -u fluid.py steps
 """
 
 from __future__ import annotations
@@ -551,6 +557,196 @@ def _report_power() -> None:
     print(f"power divide-back {back_hits}/{len(bases)}", flush=True)
 
 
+def _multiply_chain(
+    model: FluidForCausalLM,
+    lefts: list[list[int]],
+    rights: list[list[int]],
+    device: torch.device,
+) -> list[list[int]]:
+    """Multiply written answers with the place-value chain, one batch at a time."""
+    count = len(lefts)
+    left_digits = [place._digits_of(tokens) for tokens in lefts]
+    right_digits = [place._digits_of(tokens) for tokens in rights]
+    partials: list[list[list[int]]] = [[] for _ in range(count)]
+    for i in range(place.PLACES):
+        for j in range(place.PLACES):
+            active = [
+                row
+                for row in range(count)
+                if left_digits[row][i] != 0 and right_digits[row][j] != 0
+            ]
+            if not active:
+                continue
+            print(f"steps mul places {i}+{j} rows {len(active)}", flush=True)
+            totals = [scratch._number(0) for _ in active]
+            addends = [scratch._number(left_digits[row][i]) for row in active]
+            remaining = [right_digits[row][j] for row in active]
+            while any(item > 0 for item in remaining):
+                todo = [index for index, item in enumerate(remaining) if item > 0]
+                wrote = place._rule_add_many(
+                    model.place,
+                    [totals[index] for index in todo],
+                    [addends[index] for index in todo],
+                    device,
+                )
+                for index, answer in zip(todo, wrote):
+                    totals[index] = answer
+                    remaining[index] -= 1
+            for index, row in enumerate(active):
+                shifted = place._answer(place._shift_places(place._digits_of(totals[index]), i + j))
+                partials[row].append(shifted)
+    running = [scratch._number(0) for _ in range(count)]
+    width = max((len(row) for row in partials), default=0)
+    for index in range(width):
+        todo = [row for row in range(count) if index < len(partials[row])]
+        wrote = place._rule_add_many(
+            model.place,
+            [running[row] for row in todo],
+            [partials[row][index] for row in todo],
+            device,
+        )
+        for row, answer in zip(todo, wrote):
+            running[row] = answer
+    return running
+
+
+def _apply_many(
+    model: FluidForCausalLM,
+    lefts: list[list[int]],
+    rights: list[list[int]],
+    op: int,
+    device: torch.device,
+) -> list[list[int]]:
+    """One operation on written token lines."""
+    if op == scratch.OP_ADD:
+        return place._rule_add_many(model.place, lefts, rights, device)
+    if op == scratch.OP_SUB:
+        return place._rule_sub_many(model.place, lefts, rights, device)
+    if op == scratch.OP_MUL:
+        return _multiply_chain(model, lefts, rights, device)
+    if op == scratch.OP_DIV:
+        quotients, remainders = place._rule_div_many(model.place, lefts, rights, device)
+        for remainder in remainders:
+            if not place._is_zero(remainder):
+                raise RuntimeError("a step division left a remainder")
+        return quotients
+    raise RuntimeError(f"step operation {op} is not in the runner")
+
+
+def _run_steps(
+    model: FluidForCausalLM,
+    steps: tuple[tuple[str, str, int], ...],
+    bound: dict[str, list[list[int]]],
+    device: torch.device,
+    prev: list[list[int]] | None = None,
+    probe: int | None = None,
+) -> list[list[int]]:
+    """Run a formula. ``prev`` on the next line is the token list just written."""
+    if not steps:
+        raise RuntimeError("a formula has no steps")
+    written = prev
+    for left_name, right_name, op in steps:
+        if left_name == "prev":
+            if written is None:
+                raise RuntimeError("a step asked for a line that was not written")
+            lefts = written
+        else:
+            lefts = bound[left_name]
+        if right_name == "prev":
+            if written is None:
+                raise RuntimeError("a step asked for a line that was not written")
+            rights = written
+        else:
+            rights = bound[right_name]
+        if left_name == "prev" and lefts is not written:
+            raise RuntimeError("step left side is not the written line")
+        if right_name == "prev" and rights is not written:
+            raise RuntimeError("step right side is not the written line")
+        wrote = _apply_many(model, lefts, rights, op, device)
+        if probe is not None:
+            print(
+                f"  {scratch._read_number(lefts[probe])}{place.NAME[op]}{scratch._read_number(rights[probe])}={scratch._read_number(wrote[probe])} tokens {wrote[probe]}",
+                flush=True,
+            )
+        written = wrote
+    if written is None:
+        raise RuntimeError("a formula wrote nothing")
+    return written
+
+
+def _score_lines(label: str, pairs: list[tuple[int, int]], written: list[list[int]], expect) -> None:
+    hits = 0
+    for (left, right), tokens in zip(pairs, written):
+        got = scratch._read_number(tokens)
+        truth = expect(left, right)
+        if got == truth:
+            hits += 1
+        else:
+            print(f"miss {label} {left} {right} truth {truth} pred {got}", flush=True)
+    print(f"steps {label} {hits}/{len(pairs)}", flush=True)
+
+
+def _report_steps() -> None:
+    """Compose written lines with one runner, then invert those lines."""
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available. Refusing to build the model in system RAM.")
+    device = torch.device("cuda")
+    print(torch.cuda.get_device_name(0), flush=True)
+    model = _load(device)
+    pairs = [(left, right) for left in range(scratch.FAR_LO, scratch.FAR_HI + 1) for right in range(scratch.FAR_LO, scratch.FAR_HI + 1)]
+    bound = {
+        "a": [scratch._number(left) for left, _right in pairs],
+        "b": [scratch._number(right) for _left, right in pairs],
+    }
+    probe = pairs.index((37, 35))
+    formulas = (
+        (
+            "sum*left",
+            (("a", "b", scratch.OP_ADD), ("prev", "a", scratch.OP_MUL)),
+            (("prev", "a", scratch.OP_DIV), ("prev", "b", scratch.OP_SUB)),
+            lambda left, right: (left + right) * left,
+            lambda left, _right: left,
+        ),
+        (
+            "prod+left",
+            (("a", "b", scratch.OP_MUL), ("prev", "a", scratch.OP_ADD)),
+            (("prev", "a", scratch.OP_SUB), ("prev", "a", scratch.OP_DIV)),
+            lambda left, right: (left * right) + left,
+            lambda _left, right: right,
+        ),
+    )
+    for name, forward, inverse, forward_expect, inverse_expect in formulas:
+        print(f"steps {name}", flush=True)
+        written = _run_steps(model, forward, bound, device, probe=probe)
+        _score_lines(name, pairs, written, forward_expect)
+        print(f"steps {name} back", flush=True)
+        restored = _run_steps(model, inverse, bound, device, prev=written, probe=probe)
+        _score_lines(f"{name} back", pairs, restored, inverse_expect)
+    print("steps 12^3", flush=True)
+    twelve = {"a": [scratch._number(12)]}
+    cubed = _run_steps(
+        model,
+        (("a", "a", scratch.OP_MUL), ("prev", "a", scratch.OP_MUL)),
+        twelve,
+        device,
+        probe=0,
+    )
+    print(f"steps 12^3 = {scratch._read_number(cubed[0])}", flush=True)
+    if scratch._read_number(cubed[0]) != 12 ** 3:
+        raise RuntimeError("the step runner missed 12^3")
+    restored = _run_steps(
+        model,
+        (("prev", "a", scratch.OP_DIV), ("prev", "a", scratch.OP_DIV)),
+        twelve,
+        device,
+        prev=cubed,
+        probe=0,
+    )
+    print(f"steps 12^3 back = {scratch._read_number(restored[0])}", flush=True)
+    if scratch._read_number(restored[0]) != 12:
+        raise RuntimeError("the step runner did not invert 12^3")
+
+
 def _chain(model: FluidForCausalLM, rows: list[tuple[int, int, int, int]], extra, device: torch.device) -> tuple[int, int]:
     prompts = _prompts(rows, device)
     first = _generate_answer(model, prompts)
@@ -682,5 +878,7 @@ if __name__ == "__main__":
         _report_thought()
     elif len(sys.argv) > 1 and sys.argv[1] == "power":
         _report_power()
+    elif len(sys.argv) > 1 and sys.argv[1] == "steps":
+        _report_steps()
     else:
         main()

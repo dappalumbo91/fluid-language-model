@@ -49,6 +49,12 @@ Far products were 225/225. The written product plus 1 was 225/225. The written p
 
 Squares were 44/44. Higher exponents were 45/45. Divide-back was 44/44. `37^2` is 1369, and `1369/37` is 37. `12^2` is 144. `12^3` wrote `728+1000=1728`, and `1728/12` is 144. `2^13` is 8192, and `8192/2` is 4096.
 
+## Steps
+
+`python -u fluid.py steps` on an NVIDIA GeForce RTX 5070, 2026-11-10, finished in 90 seconds. A formula is a list of operations. `prev` is the token list the previous line wrote. The same runner adds, multiplies, and inverts.
+
+Far pairs 31 through 45. `(left+right)*left` was 225/225, and running that line backward was 225/225. `37+35=72`, `72*37=2664`, `2664/37=72`, `72-35=37`. `(left*right)+left` was 225/225, and running that line backward was 225/225. `37*35=1295`, `1295+37=1332`, `1332-37=1295`, `1295/37=35`. The same steps write `12^3` as 1728 and divide it back to 12.
+
 ## Load
 
 ```python
