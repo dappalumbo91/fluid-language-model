@@ -30,13 +30,16 @@ The command does not train and it does not write a checkpoint.
 
 ``steps`` is the one runner for a new formula. A formula is a list of
 operations on names. ``prev`` is the token list the previous line wrote.
-The same runner multiplies, adds, and inverts. It does not train and it
-does not write a checkpoint.
+A step may also store that line under a name, and a later step may read it.
+``lines`` uses two stored lines: ``(a+b)*(a-b)`` and ``a*a-b*b``. Those
+writings have to agree. The command does not train and it does not write
+a checkpoint.
 
     python -u fluid.py
     python -u fluid.py think
     python -u fluid.py power
     python -u fluid.py steps
+    python -u fluid.py lines
 """
 
 from __future__ import annotations
@@ -635,34 +638,42 @@ def _apply_many(
 
 def _run_steps(
     model: FluidForCausalLM,
-    steps: tuple[tuple[str, str, int], ...],
+    steps: tuple[tuple, ...],
     bound: dict[str, list[list[int]]],
     device: torch.device,
     prev: list[list[int]] | None = None,
     probe: int | None = None,
+    saved: dict[str, list[list[int]]] | None = None,
 ) -> list[list[int]]:
     """Run a formula. ``prev`` on the next line is the token list just written."""
     if not steps:
         raise RuntimeError("a formula has no steps")
+    names = dict(bound)
     written = prev
-    for left_name, right_name, op in steps:
+    for step in steps:
+        left_name, right_name, op = step[0], step[1], step[2]
+        dest = step[3] if len(step) == 4 else None
         if left_name == "prev":
             if written is None:
                 raise RuntimeError("a step asked for a line that was not written")
             lefts = written
         else:
-            lefts = bound[left_name]
+            lefts = names[left_name]
         if right_name == "prev":
             if written is None:
                 raise RuntimeError("a step asked for a line that was not written")
             rights = written
         else:
-            rights = bound[right_name]
+            rights = names[right_name]
         if left_name == "prev" and lefts is not written:
             raise RuntimeError("step left side is not the written line")
         if right_name == "prev" and rights is not written:
             raise RuntimeError("step right side is not the written line")
         wrote = _apply_many(model, lefts, rights, op, device)
+        if dest is not None:
+            names[dest] = wrote
+            if saved is not None:
+                saved[dest] = wrote
         if probe is not None:
             print(
                 f"  {scratch._read_number(lefts[probe])}{place.NAME[op]}{scratch._read_number(rights[probe])}={scratch._read_number(wrote[probe])} tokens {wrote[probe]}",
@@ -745,6 +756,98 @@ def _report_steps() -> None:
     print(f"steps 12^3 back = {scratch._read_number(restored[0])}", flush=True)
     if scratch._read_number(restored[0]) != 12:
         raise RuntimeError("the step runner did not invert 12^3")
+
+
+def _same_value(label: str, pairs: list[tuple[int, int]], lefts: list[list[int]], rights: list[list[int]]) -> None:
+    hits = 0
+    for (left, right), lhs, rhs in zip(pairs, lefts, rights):
+        got_left = scratch._read_number(lhs)
+        got_right = scratch._read_number(rhs)
+        if got_left == got_right:
+            hits += 1
+        else:
+            print(f"unresolved {label} {left} {right} {got_left} against {got_right}", flush=True)
+    print(f"lines {label} {hits}/{len(pairs)}", flush=True)
+
+
+def _report_lines() -> None:
+    """Keep two written lines and require the two formulas to agree."""
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available. Refusing to build the model in system RAM.")
+    device = torch.device("cuda")
+    print(torch.cuda.get_device_name(0), flush=True)
+    model = _load(device)
+    pairs = [
+        (left, right)
+        for left in range(scratch.FAR_LO, scratch.FAR_HI + 1)
+        for right in range(scratch.FAR_LO, left + 1)
+    ]
+    bound = {
+        "a": [scratch._number(left) for left, _right in pairs],
+        "b": [scratch._number(right) for _left, right in pairs],
+    }
+    probe = pairs.index((45, 31))
+    print("lines (a+b)*(a-b)", flush=True)
+    product: dict[str, list[list[int]]] = {}
+    _run_steps(
+        model,
+        (
+            ("a", "b", scratch.OP_ADD, "sum"),
+            ("a", "b", scratch.OP_SUB, "diff"),
+            ("sum", "diff", scratch.OP_MUL, "prod"),
+        ),
+        bound,
+        device,
+        probe=probe,
+        saved=product,
+    )
+    print("lines a*a-b*b", flush=True)
+    squares: dict[str, list[list[int]]] = {}
+    _run_steps(
+        model,
+        (
+            ("a", "a", scratch.OP_MUL, "aa"),
+            ("b", "b", scratch.OP_MUL, "bb"),
+            ("aa", "bb", scratch.OP_SUB, "gap"),
+        ),
+        bound,
+        device,
+        probe=probe,
+        saved=squares,
+    )
+    _same_value("agree", pairs, product["prod"], squares["gap"])
+    hits = 0
+    for (left, right), tokens in zip(pairs, product["prod"]):
+        got = scratch._read_number(tokens)
+        truth = left * left - right * right
+        if got == truth:
+            hits += 1
+        else:
+            print(f"miss lines {left} {right} truth {truth} pred {got}", flush=True)
+    print(f"lines far {hits}/{len(pairs)}", flush=True)
+    print("lines prod/sum", flush=True)
+    by_sum = _apply_many(model, product["prod"], product["sum"], scratch.OP_DIV, device)
+    _same_value("prod/sum", pairs, by_sum, product["diff"])
+    live = [index for index, tokens in enumerate(product["diff"]) if not place._is_zero(tokens)]
+    print(f"lines prod/diff rows {len(live)}", flush=True)
+    by_diff = _apply_many(
+        model,
+        [product["prod"][index] for index in live],
+        [product["diff"][index] for index in live],
+        scratch.OP_DIV,
+        device,
+    )
+    _same_value(
+        "prod/diff",
+        [pairs[index] for index in live],
+        by_diff,
+        [product["sum"][index] for index in live],
+    )
+    tie = pairs.index((37, 37))
+    print(
+        f"lines 37*37 gap {scratch._read_number(product['prod'][tie])} {scratch._read_number(squares['gap'][tie])}",
+        flush=True,
+    )
 
 
 def _chain(model: FluidForCausalLM, rows: list[tuple[int, int, int, int]], extra, device: torch.device) -> tuple[int, int]:
@@ -880,5 +983,7 @@ if __name__ == "__main__":
         _report_power()
     elif len(sys.argv) > 1 and sys.argv[1] == "steps":
         _report_steps()
+    elif len(sys.argv) > 1 and sys.argv[1] == "lines":
+        _report_lines()
     else:
         main()

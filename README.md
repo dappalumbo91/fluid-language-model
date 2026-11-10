@@ -55,6 +55,12 @@ Squares were 44/44. Higher exponents were 45/45. Divide-back was 44/44. `37^2` i
 
 Far pairs 31 through 45. `(left+right)*left` was 225/225, and running that line backward was 225/225. `37+35=72`, `72*37=2664`, `2664/37=72`, `72-35=37`. `(left*right)+left` was 225/225, and running that line backward was 225/225. `37*35=1295`, `1295+37=1332`, `1332-37=1295`, `1295/37=35`. The same steps write `12^3` as 1728 and divide it back to 12.
 
+## Two lines
+
+`python -u fluid.py lines` on an NVIDIA GeForce RTX 5070, 2026-11-10, finished in 32 seconds. A step can store its tokens under a name. A later step can read that name.
+
+Far pairs with the left operand at least the right, 31 through 45. `(a+b)*(a-b)` and `a*a-b*b` agreed on 120/120, and both matched the outside value on 120/120. `45+31=76`, `45-31=14`, `76*14=1064`. `45*45=2025`, `31*31=961`, `2025-961=1064`. Those two results are the same tokens. The product divided by the sum recovers the difference on 120/120. The product divided by the difference recovers the sum on the 105 rows whose difference is not zero. `37` against `37` writes 0 and 0.
+
 ## Load
 
 ```python
