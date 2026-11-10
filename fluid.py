@@ -23,8 +23,14 @@ wrote. A place shift is applied to those tokens, and the shifted tokens are
 a later right operand. The command scores far products. It does not train
 and it does not write a checkpoint.
 
+``power`` multiplies that written product by the base again. A result that
+would not fit in four places is not attempted. The last written power is
+then divided by the base, and that quotient has to be the previous line.
+The command does not train and it does not write a checkpoint.
+
     python -u fluid.py
     python -u fluid.py think
+    python -u fluid.py power
 """
 
 from __future__ import annotations
@@ -408,6 +414,143 @@ def _report_thought() -> None:
     print(f"thought product/right {div_hits}/{len(rows)}", flush=True)
 
 
+def _multiply_written(
+    model: FluidForCausalLM,
+    lefts: list[list[int]],
+    rights: list[list[int]],
+    device: torch.device,
+    probe: set[tuple[int, int]] | None = None,
+) -> list[list[int]]:
+    """Multiply written answers. The next addition reads the tokens just written."""
+    count = len(lefts)
+    left_digits = [place._digits_of(tokens) for tokens in lefts]
+    right_digits = [place._digits_of(tokens) for tokens in rights]
+    partials: list[list[list[int]]] = [[] for _ in range(count)]
+    watched = probe or set()
+    for i in range(place.PLACES):
+        for j in range(place.PLACES):
+            active = [
+                row
+                for row in range(count)
+                if left_digits[row][i] != 0 and right_digits[row][j] != 0
+            ]
+            if not active:
+                continue
+            print(f"power mul places {i}+{j} rows {len(active)}", flush=True)
+            totals = [scratch._number(0) for _ in active]
+            addends = [scratch._number(left_digits[row][i]) for row in active]
+            remaining = [right_digits[row][j] for row in active]
+            while any(item > 0 for item in remaining):
+                todo = [index for index, item in enumerate(remaining) if item > 0]
+                before = [totals[index] for index in todo]
+                step_rights = [addends[index] for index in todo]
+                wrote = _write_lines(model, before, step_rights, scratch.OP_ADD, device)
+                for index, answer, left_tokens, right_tokens in zip(todo, wrote, before, step_rights):
+                    pair = (scratch._read_number(lefts[active[index]]), scratch._read_number(rights[active[index]]))
+                    if pair in watched:
+                        print(
+                            f"  {scratch._read_number(left_tokens)}+{scratch._read_number(right_tokens)}={scratch._read_number(answer)}",
+                            flush=True,
+                        )
+                    totals[index] = answer
+                    remaining[index] -= 1
+            for index, row in enumerate(active):
+                shifted = place._answer(place._shift_places(place._digits_of(totals[index]), i + j))
+                partials[row].append(shifted)
+                pair = (scratch._read_number(lefts[row]), scratch._read_number(rights[row]))
+                if pair in watched:
+                    print(
+                        f"  place {i}+{j} -> {scratch._read_number(shifted)} tokens {shifted}",
+                        flush=True,
+                    )
+    running = [scratch._number(0) for _ in range(count)]
+    width = max((len(row) for row in partials), default=0)
+    for index in range(width):
+        todo = [row for row in range(count) if index < len(partials[row])]
+        before = [running[row] for row in todo]
+        step_rights = [partials[row][index] for row in todo]
+        wrote = _write_lines(model, before, step_rights, scratch.OP_ADD, device)
+        for row, answer, left_tokens, right_tokens in zip(todo, wrote, before, step_rights):
+            pair = (scratch._read_number(lefts[row]), scratch._read_number(rights[row]))
+            if pair in watched:
+                print(
+                    f"  use {left_tokens}+{right_tokens}={answer}  {scratch._read_number(left_tokens)}+{scratch._read_number(right_tokens)}={scratch._read_number(answer)}",
+                    flush=True,
+                )
+            running[row] = answer
+    return running
+
+
+def _report_power() -> None:
+    """Score powers built by multiplying the written line by the base again."""
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available. Refusing to build the model in system RAM.")
+    device = torch.device("cuda")
+    print(torch.cuda.get_device_name(0), flush=True)
+    model = _load(device)
+    bases = list(range(2, scratch.FAR_HI + 1))
+    limit = 10 ** scratch.WIDTH - 1
+    base_tokens = [scratch._number(base) for base in bases]
+    running = [list(tokens) for tokens in base_tokens]
+    previous = [list(tokens) for tokens in base_tokens]
+    square_hits = square_rows = 0
+    higher_hits = higher_rows = 0
+    shown = {2, 12, 37}
+    probe = {(12, 12), (144, 12)}
+    exponent = 1
+    while True:
+        todo = []
+        for index, base in enumerate(bases):
+            current = scratch._read_number(running[index])
+            if current is None or current < 0 or current * base > limit:
+                continue
+            todo.append(index)
+        if not todo:
+            break
+        exponent += 1
+        print(f"power exp {exponent} rows {len(todo)}", flush=True)
+        wrote = _multiply_written(
+            model,
+            [running[index] for index in todo],
+            [base_tokens[index] for index in todo],
+            device,
+            probe,
+        )
+        for index, tokens in zip(todo, wrote):
+            previous[index] = running[index]
+            running[index] = tokens
+            got = scratch._read_number(tokens)
+            expect = bases[index] ** exponent
+            if exponent == 2:
+                square_rows += 1
+                square_hits += int(got == expect)
+            else:
+                higher_rows += 1
+                higher_hits += int(got == expect)
+            if got != expect:
+                print(f"miss ^{exponent} {bases[index]} truth {expect} pred {got}", flush=True)
+            if bases[index] in shown:
+                print(f"power {bases[index]}^{exponent} = {got} tokens {tokens}", flush=True)
+    print(f"power squares {square_hits}/{square_rows}", flush=True)
+    print(f"power higher {higher_hits}/{higher_rows}", flush=True)
+    print("power divide-back", flush=True)
+    quotients = _write_lines(model, running, base_tokens, scratch.OP_DIV, device)
+    back_hits = 0
+    for index, tokens in enumerate(quotients):
+        got = scratch._read_number(tokens)
+        expect = scratch._read_number(previous[index])
+        if got == expect:
+            back_hits += 1
+        else:
+            print(f"miss /base {bases[index]} truth {expect} pred {got}", flush=True)
+        if bases[index] in shown:
+            print(
+                f"power {scratch._read_number(running[index])}/{bases[index]} = {got}",
+                flush=True,
+            )
+    print(f"power divide-back {back_hits}/{len(bases)}", flush=True)
+
+
 def _chain(model: FluidForCausalLM, rows: list[tuple[int, int, int, int]], extra, device: torch.device) -> tuple[int, int]:
     prompts = _prompts(rows, device)
     first = _generate_answer(model, prompts)
@@ -537,5 +680,7 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "think":
         _report_thought()
+    elif len(sys.argv) > 1 and sys.argv[1] == "power":
+        _report_power()
     else:
         main()

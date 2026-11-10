@@ -43,6 +43,12 @@ Far products were 225/225. The written product plus 1 was 225/225. The written p
 
 `37*37` wrote `42+7=49`, then place `0+0` as 49. The partial sums were `0+49=49`, `49+210=259`, `259+210=469`, and `469+900=1369`. The `49` on the next line is the token list `[2, 20, 15, 11, 11]` that the previous line wrote. The written 1369 plus 1 is 1370. The written 1369 divided by 37 is 37.
 
+## Powers
+
+`python -u fluid.py power` on an NVIDIA GeForce RTX 5070, 2026-11-10. A power multiplies the written product by the base again. Bases 2 through 45. A product that would not fit in four places is not attempted. The last written power is divided by the base, and that quotient is the previous line.
+
+Squares were 44/44. Higher exponents were 45/45. Divide-back was 44/44. `37^2` is 1369, and `1369/37` is 37. `12^2` is 144. `12^3` wrote `728+1000=1728`, and `1728/12` is 144. `2^13` is 8192, and `8192/2` is 4096.
+
 ## Load
 
 ```python
