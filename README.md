@@ -35,6 +35,14 @@ The pass counter printed `passes kept 725 rewritten 415`. Those two counts are t
 
 These far counts are the two-pass generate. They are not a claim that the learned sweep, scored on its own, writes every far row.
 
+## Written steps
+
+`python -u fluid.py think` on an NVIDIA GeForce RTX 5070, 2026-11-10. Each addition inside a product is one `generate` call. The next prompt starts with the tokens that call just wrote. A place shift is applied to those tokens, and the shifted tokens are a later right operand.
+
+Far products were 225/225. The written product plus 1 was 225/225. The written product divided by the right factor was 225/225.
+
+`37*37` wrote `42+7=49`, then place `0+0` as 49. The partial sums were `0+49=49`, `49+210=259`, `259+210=469`, and `469+900=1369`. The `49` on the next line is the token list `[2, 20, 15, 11, 11]` that the previous line wrote. The written 1369 plus 1 is 1370. The written 1369 divided by 37 is 37.
+
 ## Load
 
 ```python

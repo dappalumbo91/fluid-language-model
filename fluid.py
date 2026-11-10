@@ -17,12 +17,20 @@ The first pass is the learned place forward. When its tokens disagree with
 the place-value chain, a second pass writes the chain's tokens. The chain
 is the offset already in the model. Weights load from ``weights/place/factor.pt``.
 
+``think`` writes a product as one addition at a time. Each line is a
+``generate`` call. The next line's left side is the tokens that call just
+wrote. A place shift is applied to those tokens, and the shifted tokens are
+a later right operand. The command scores far products. It does not train
+and it does not write a checkpoint.
+
     python -u fluid.py
+    python -u fluid.py think
 """
 
 from __future__ import annotations
 
 import shutil
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -248,6 +256,158 @@ def _generate_answer(model: FluidForCausalLM, prompts: torch.Tensor) -> torch.Te
     return drafted[:, prompts.shape[1] :]
 
 
+def _line_prompts(
+    lefts: list[list[int]],
+    rights: list[list[int]],
+    op: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """One equation prompt. The left side is an answer already written."""
+    if len(lefts) != len(rights) or not lefts:
+        raise RuntimeError("thought lines are empty")
+    rows = []
+    for left, right in zip(lefts, rights):
+        if len(left) != ANSWER_LEN or len(right) != ANSWER_LEN:
+            raise RuntimeError("thought side is not an answer")
+        rows.append(left + [op] + right + [EQ])
+    return torch.tensor(rows, dtype=torch.long, device=device)
+
+
+def _write_lines(
+    model: FluidForCausalLM,
+    lefts: list[list[int]],
+    rights: list[list[int]],
+    op: int,
+    device: torch.device,
+) -> list[list[int]]:
+    """Generate one line. The prompt's left tokens are the previous answer."""
+    prompts = _line_prompts(lefts, rights, op, device)
+    if prompts[:, :ANSWER_LEN].tolist() != lefts:
+        raise RuntimeError("prompt does not start with the written answer")
+    if prompts[:, 6 : 6 + ANSWER_LEN].tolist() != rights:
+        raise RuntimeError("prompt right side drifted")
+    return _generate_answer(model, prompts).tolist()
+
+
+def _thought_products(
+    model: FluidForCausalLM,
+    pairs: list[tuple[int, int]],
+    device: torch.device,
+) -> list[list[int]]:
+    """Multiply by writing each addition and reading those tokens back."""
+    count = len(pairs)
+    left_digits = [place._operand_digits(left) for left, _right in pairs]
+    right_digits = [place._operand_digits(right) for _left, right in pairs]
+    partials: list[list[list[int]]] = [[] for _ in range(count)]
+    probe = (37, 37)
+    for i in range(place.PLACES):
+        for j in range(place.PLACES):
+            active = [
+                row
+                for row in range(count)
+                if left_digits[row][i] != 0 and right_digits[row][j] != 0
+            ]
+            if not active:
+                continue
+            totals = [scratch._number(0) for _ in active]
+            addends = [scratch._number(left_digits[row][i]) for row in active]
+            remaining = [right_digits[row][j] for row in active]
+            step = 0
+            while any(item > 0 for item in remaining):
+                todo = [index for index, item in enumerate(remaining) if item > 0]
+                print(f"thought pair {i}+{j} step {step} rows {len(todo)}", flush=True)
+                before = [totals[index] for index in todo]
+                rights = [addends[index] for index in todo]
+                wrote = _write_lines(model, before, rights, scratch.OP_ADD, device)
+                for index, answer, left_tokens, right_tokens in zip(todo, wrote, before, rights):
+                    if pairs[active[index]] == probe:
+                        print(
+                            f"  {scratch._read_number(left_tokens)}+{scratch._read_number(right_tokens)}={scratch._read_number(answer)}",
+                            flush=True,
+                        )
+                    totals[index] = answer
+                    remaining[index] -= 1
+                step += 1
+            for index, row in enumerate(active):
+                shifted = place._answer(place._shift_places(place._digits_of(totals[index]), i + j))
+                partials[row].append(shifted)
+                if pairs[row] == probe:
+                    print(
+                        f"  place {i}+{j} -> {scratch._read_number(shifted)} tokens {shifted}",
+                        flush=True,
+                    )
+    running = [scratch._number(0) for _ in range(count)]
+    width = max((len(row) for row in partials), default=0)
+    for index in range(width):
+        todo = [row for row in range(count) if index < len(partials[row])]
+        print(f"thought sum partial {index} rows {len(todo)}", flush=True)
+        before = [running[row] for row in todo]
+        rights = [partials[row][index] for row in todo]
+        wrote = _write_lines(model, before, rights, scratch.OP_ADD, device)
+        for row, answer, left_tokens, right_tokens in zip(todo, wrote, before, rights):
+            if pairs[row] == probe:
+                print(
+                    f"  use {left_tokens}+{right_tokens}={answer}  {scratch._read_number(left_tokens)}+{scratch._read_number(right_tokens)}={scratch._read_number(answer)}",
+                    flush=True,
+                )
+            running[row] = answer
+    return running
+
+
+def _report_thought() -> None:
+    """Score far products whose steps are generate calls on the previous line."""
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available. Refusing to build the model in system RAM.")
+    device = torch.device("cuda")
+    print(torch.cuda.get_device_name(0), flush=True)
+    model = _load(device)
+    rows = [row for row in scratch._banks()["far"] if row[0] == scratch.OP_MUL]
+    pairs = [(left, right) for _op, left, right, _value in rows]
+    written = _thought_products(model, pairs, device)
+    hits = 0
+    for row, tokens in zip(rows, written):
+        got = scratch._read_number(tokens)
+        if got == row[3]:
+            hits += 1
+        else:
+            print(f"miss * {row[1]} {row[2]} truth {row[3]} pred {got}", flush=True)
+        if (row[1], row[2]) == (37, 37):
+            print(f"thought 37*37 = {got} tokens {tokens}", flush=True)
+    print(f"thought far * {hits}/{len(rows)}", flush=True)
+    plus = _write_lines(model, written, [scratch._number(1) for _ in rows], scratch.OP_ADD, device)
+    plus_hits = 0
+    for row, tokens, base in zip(rows, plus, written):
+        if scratch._read_number(tokens) == row[3] + 1:
+            plus_hits += 1
+        else:
+            print(
+                f"miss *+1 {row[1]} {row[2]} truth {row[3] + 1} pred {scratch._read_number(tokens)}",
+                flush=True,
+            )
+        if (row[1], row[2]) == (37, 37):
+            print(
+                f"thought {scratch._read_number(base)}+1 = {scratch._read_number(tokens)}",
+                flush=True,
+            )
+    print(f"thought product+1 {plus_hits}/{len(rows)}", flush=True)
+    divided = _write_lines(
+        model,
+        written,
+        [scratch._number(right) for _op, _left, right, _value in rows],
+        scratch.OP_DIV,
+        device,
+    )
+    div_hits = 0
+    for row, tokens in zip(rows, divided):
+        if scratch._read_number(tokens) == row[1]:
+            div_hits += 1
+        else:
+            print(f"miss */right {row[1]} {row[2]} truth {row[1]} pred {scratch._read_number(tokens)}", flush=True)
+        if (row[1], row[2]) == (37, 37):
+            print(f"thought product/37 = {scratch._read_number(tokens)}", flush=True)
+    print(f"thought product/right {div_hits}/{len(rows)}", flush=True)
+
+
 def _chain(model: FluidForCausalLM, rows: list[tuple[int, int, int, int]], extra, device: torch.device) -> tuple[int, int]:
     prompts = _prompts(rows, device)
     first = _generate_answer(model, prompts)
@@ -375,4 +535,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "think":
+        _report_thought()
+    else:
+        main()
